@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "alexokita.dgx-spark-widget",
+  "name": "DGX Spark Status Widget",
+  "version": "0.2.1",
+  "author": "Alex Okita",
+  "license": "MIT",
+  "description": "DGX Spark status: SSH sign-in popout, CPU/GPU/MEM sparklines, LLM tok/s, and iface rates.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "DGX Spark Status Widget",
+    "description": "Compact DGX Spark status: connection path, LLM load, and iface rates.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}
