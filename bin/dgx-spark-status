@@ -36,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "llmPort": 8888,
     "llmBaseUrl": "",
     "connectTimeoutSec": 2.0,
+    "sshControlPersist": "10m",
     "historyPoints": 30,
     "ports": [22, 3000, 8888],
 }
@@ -45,6 +46,78 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "dgx-spark-widget"
 STATE_PATH = STATE_DIR / "status.json"
 HISTORY_PATH = STATE_DIR / "history.json"
+
+# Opt-in tick logging (never includes secrets).
+_debug_log_path: Path | None = None
+_tick_debug: dict[str, Any] = {}
+
+
+def _debug_log_enabled() -> bool:
+    return _debug_log_path is not None
+
+
+def configure_debug_log(path: Path | None) -> None:
+    global _debug_log_path
+    _debug_log_path = path
+
+
+def reset_tick_debug() -> None:
+    _tick_debug.clear()
+
+
+def note_tick_reauth(reason: str) -> None:
+    _tick_debug["reauth"] = reason
+
+
+def note_tick_session(*, reused: bool) -> None:
+    _tick_debug["reused"] = reused
+
+
+def mark_status_tick() -> None:
+    """Only status polls should emit NEW_LOGIN/REUSED tick lines."""
+    _tick_debug["tick"] = True
+
+
+def append_debug_line(message: str) -> None:
+    if not _debug_log_path:
+        return
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"{ts} {message}\n"
+    try:
+        _debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with _debug_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def flush_tick_debug_log() -> None:
+    if not _debug_log_path or not _tick_debug.get("tick"):
+        return
+    reused = bool(_tick_debug.get("reused"))
+    if _tick_debug.get("reauth"):
+        reused = False
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    parts = [ts]
+    if _tick_debug.get("reauth"):
+        parts.append(f"REAUTH after {_tick_debug['reauth']}")
+    parts.append("REUSED" if reused else "NEW_LOGIN")
+    line = " ".join(parts) + "\n"
+    try:
+        _debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with _debug_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def init_debug_logging(debug_log: str | None = None) -> None:
+    if debug_log:
+        configure_debug_log(Path(debug_log).expanduser())
+        return
+    if os.environ.get("DGX_SPARK_WIDGET_DEBUG") == "1":
+        configure_debug_log(STATE_DIR / "widget-debug.log")
+
 
 SERVICE_PROBES = (
     {
@@ -278,9 +351,40 @@ def ssh_identity_args(cfg: dict[str, Any]) -> list[str]:
     return []
 
 
-def ssh_base_cmd(cfg: dict[str, Any], target: str, timeout: float) -> list[str]:
+def ssh_control_dir() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        base = Path(runtime) / "dgx-spark-widget"
+    else:
+        base = Path.home() / ".cache" / "dgx-spark-widget"
+    base.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    return base
+
+
+def ssh_control_path_template(cfg: dict[str, Any]) -> str:
+    """Short ControlPath template (%C keeps socket paths within unix limits)."""
+    _ = cfg
+    return str(ssh_control_dir() / "cm-%C")
+
+
+def ssh_multiplex_options(cfg: dict[str, Any]) -> list[str]:
+    persist = str(cfg.get("sshControlPersist") or DEFAULTS["sshControlPersist"])
     return [
-        "ssh",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={ssh_control_path_template(cfg)}",
+        "-o",
+        f"ControlPersist={persist}",
+    ]
+
+
+def ssh_common_options(cfg: dict[str, Any], timeout: float) -> list[str]:
+    return [
         *ssh_identity_args(cfg),
         "-o",
         "BatchMode=yes",
@@ -288,8 +392,148 @@ def ssh_base_cmd(cfg: dict[str, Any], target: str, timeout: float) -> list[str]:
         f"ConnectTimeout={max(1, int(timeout))}",
         "-o",
         "StrictHostKeyChecking=accept-new",
+    ]
+
+
+def ssh_base_cmd(
+    cfg: dict[str, Any], target: str, timeout: float, *, multiplex: bool = True
+) -> list[str]:
+    cmd = ["ssh", *ssh_common_options(cfg, timeout)]
+    if multiplex:
+        cmd.extend(ssh_multiplex_options(cfg))
+    cmd.append(target)
+    return cmd
+
+
+def ssh_resolved_control_path(cfg: dict[str, Any], target: str, timeout: float) -> str | None:
+    cmd = ["ssh", *ssh_common_options(cfg, timeout), *ssh_multiplex_options(cfg), "-G", target]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("controlpath "):
+            return line.split(" ", 1)[1].strip()
+    return None
+
+
+def ssh_master_alive(cfg: dict[str, Any], target: str, timeout: float) -> bool:
+    cmd = [
+        "ssh",
+        *ssh_common_options(cfg, timeout),
+        *ssh_multiplex_options(cfg),
+        "-O",
+        "check",
         target,
     ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def ssh_master_exit(cfg: dict[str, Any], target: str, timeout: float) -> None:
+    cmd = [
+        "ssh",
+        *ssh_common_options(cfg, timeout),
+        *ssh_multiplex_options(cfg),
+        "-O",
+        "exit",
+        target,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def remove_stale_control_socket(cfg: dict[str, Any], target: str, timeout: float) -> None:
+    path = ssh_resolved_control_path(cfg, target, timeout)
+    if not path:
+        return
+    sock = Path(path)
+    try:
+        if sock.exists():
+            sock.unlink()
+    except OSError:
+        pass
+
+
+def multiplex_close_targets(cfg: dict[str, Any], host_override: str | None = None) -> list[str]:
+    """SSH targets used for -O exit — same host resolution as status ticks."""
+    if host_override and str(host_override).strip():
+        return [preferred_ssh_target(cfg, str(host_override).strip())]
+    conn = connect(cfg)
+    if conn.get("ok") and conn.get("host"):
+        return [preferred_ssh_target(cfg, str(conn["host"]))]
+    return [preferred_ssh_target(cfg)]
+
+
+def ssh_master_exit_control_path(
+    cfg: dict[str, Any], sock_path: Path, target: str, timeout: float
+) -> bool:
+    cmd = [
+        "ssh",
+        *ssh_common_options(cfg, timeout),
+        "-S",
+        str(sock_path),
+        "-O",
+        "exit",
+        target,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def sweep_control_dir_sockets(cfg: dict[str, Any], targets: list[str], timeout: float) -> int:
+    """Safety net: exit or remove every cm-* control socket under the widget dir."""
+    closed = 0
+    ctrl = ssh_control_dir()
+    fallback = targets[0] if targets else preferred_ssh_target(cfg)
+    try_targets = targets if targets else [fallback]
+    for entry in sorted(ctrl.glob("cm-*")):
+        if not entry.exists():
+            continue
+        handled = False
+        for target in try_targets:
+            if ssh_master_exit_control_path(cfg, entry, target, timeout):
+                handled = True
+                break
+        if not handled:
+            try:
+                entry.unlink()
+                handled = True
+            except OSError:
+                pass
+        if handled:
+            closed += 1
+    return closed
+
+
+def close_multiplex_sessions(cfg: dict[str, Any], host_override: str | None = None) -> dict[str, Any]:
+    timeout = float(cfg.get("connectTimeoutSec") or 2.0)
+    targets = multiplex_close_targets(cfg, host_override)
+    for target in targets:
+        ssh_master_exit(cfg, target, timeout)
+        remove_stale_control_socket(cfg, target, timeout)
+    sockets_closed = sweep_control_dir_sockets(cfg, targets, timeout)
+    return {"targets": targets, "socketsClosed": sockets_closed}
+
+
+def is_ssh_reauth_error(result: dict[str, Any]) -> bool:
+    rc = result.get("returncode")
+    if rc == 255:
+        return True
+    err = f"{result.get('stderr') or ''}\n{result.get('error') or ''}".lower()
+    if "permission denied" in err:
+        return True
+    if "authentication failed" in err or "auth fail" in err:
+        return True
+    return False
 
 
 def preferred_ssh_target(cfg: dict[str, Any], host: str | None = None) -> str:
@@ -385,18 +629,25 @@ def probe_http_ready(host: str, port: int, timeout: float) -> dict[str, Any]:
     }
 
 
-def ssh_run(cfg: dict[str, Any], target: str, remote: str, timeout: float) -> dict[str, Any]:
+def ssh_run(
+    cfg: dict[str, Any],
+    target: str,
+    remote: str,
+    timeout: float,
+    *,
+    allow_retry: bool = True,
+) -> dict[str, Any]:
     cmd = [*ssh_base_cmd(cfg, target, timeout), remote]
     started = time.monotonic()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 8)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "target": target, "error": str(exc)}
+        return {"ok": False, "target": target, "error": str(exc), "returncode": None}
     ms = (time.monotonic() - started) * 1000
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     ok = proc.returncode == 0
-    return {
+    result = {
         "ok": ok,
         "target": target,
         "latencyMs": round(ms, 1),
@@ -405,11 +656,31 @@ def ssh_run(cfg: dict[str, Any], target: str, remote: str, timeout: float) -> di
         "returncode": proc.returncode,
         "error": None if ok else (err.splitlines()[-1] if err else f"ssh exit {proc.returncode}"),
     }
+    if ok or not allow_retry or not is_ssh_reauth_error(result):
+        return result
+    reason = result.get("error") or f"exit {result.get('returncode')}"
+    note_tick_reauth(str(reason))
+    note_tick_session(reused=False)
+    ssh_master_exit(cfg, target, timeout)
+    remove_stale_control_socket(cfg, target, timeout)
+    return ssh_run(cfg, target, remote, timeout, allow_retry=False)
 
 
-def ssh_auth_status(cfg: dict[str, Any], host: str | None = None) -> dict[str, Any]:
+def ssh_auth_status(
+    cfg: dict[str, Any], host: str | None = None, *, skip_if_master: bool = False
+) -> dict[str, Any]:
     target = preferred_ssh_target(cfg, host)
-    result = ssh_run(cfg, target, "echo OK; hostname; whoami", float(cfg.get("connectTimeoutSec") or 2.0))
+    timeout = float(cfg.get("connectTimeoutSec") or 2.0)
+    if skip_if_master and ssh_master_alive(cfg, target, timeout):
+        return {
+            "ok": True,
+            "target": target,
+            "keyPath": str(cfg.get("sshKeyPath") or ""),
+            "latencyMs": 0.0,
+            "detail": "multiplex session active",
+            "error": None,
+        }
+    result = ssh_run(cfg, target, "echo OK; hostname; whoami", timeout)
     return {
         "ok": bool(result.get("ok")) and (result.get("stdout") or "").startswith("OK"),
         "target": target,
@@ -640,20 +911,21 @@ def connect(cfg: dict[str, Any]) -> dict[str, Any]:
         }
 
         if transport == "ssh":
-            result = ssh_auth_status(cfg, host)
-            attempt.update(result)
-            attempts.append(attempt)
-            if result.get("ok"):
+            if tcp_open(host, 22, timeout):
+                attempt["tcpOpen"] = True
+                attempts.append(attempt)
                 return {
                     "ok": True,
                     "transport": "ssh",
                     "method": "ssh",
                     "host": host,
                     "label": cand["label"],
-                    "latencyMs": result.get("latencyMs"),
-                    "ssh": result,
+                    "latencyMs": None,
                     "attempts": attempts,
                 }
+            attempt["tcpOpen"] = False
+            attempt["error"] = "SSH port closed"
+            attempts.append(attempt)
             continue
 
         resolved = resolve_host(host)
@@ -740,7 +1012,9 @@ def sample_iface_rates(iface: str, dwell: float = 0.35) -> dict[str, Any] | None
     }
 
 
-def discover_services(cfg: dict[str, Any], conn: dict[str, Any]) -> list[dict[str, Any]]:
+def discover_services(
+    cfg: dict[str, Any], conn: dict[str, Any], ssh_auth: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     host = conn.get("host")
     if not host:
         return []
@@ -762,7 +1036,10 @@ def discover_services(cfg: dict[str, Any], conn: dict[str, Any]) -> list[dict[st
 
         svc["status"] = "open"
         if probe["id"] == "ssh":
-            ssh = ssh_auth_status(cfg, str(host))
+            if ssh_auth is not None:
+                ssh = ssh_auth
+            else:
+                ssh = ssh_auth_status(cfg, str(host), skip_if_master=True)
             svc["sshOk"] = bool(ssh.get("ok"))
             svc["summary"] = "auth ok" if ssh.get("ok") else (ssh.get("error") or "listening")
             services.append(svc)
@@ -854,19 +1131,67 @@ def parse_nvidia_smi(text: str) -> list[dict[str, Any]]:
 
 
 def collect_device_metrics(cfg: dict[str, Any], host: str | None) -> dict[str, Any]:
-    target = preferred_ssh_target(cfg, host)
-    timeout = max(4.0, float(cfg.get("connectTimeoutSec") or 2.0) + 2.0)
-    remote = (
-        "python3 - <<'PY'\n"
+    _auth, device = collect_auth_and_device_metrics(cfg, host, tick_session=False)
+    return device
+
+
+def metrics_remote_command(*, include_auth_header: bool) -> str:
+    header = ""
+    if include_auth_header:
+        header = "echo OK; hostname; whoami\n"
+    return (
+        header
+        + "python3 - <<'PY'\n"
         + REMOTE_METRICS_SCRIPT
         + "PY\n"
         + "nvidia-smi --query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,clocks.gr,clocks.mem,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true\n"
     )
+
+
+def auth_from_metrics_stdout(
+    cfg: dict[str, Any], target: str, stdout: str, latency_ms: float | None, *, ok: bool, error: str | None
+) -> dict[str, Any]:
+    base = {
+        "target": target,
+        "keyPath": str(cfg.get("sshKeyPath") or ""),
+        "latencyMs": latency_ms,
+        "error": error,
+    }
+    text = stdout or ""
+    if ok and text.startswith("OK"):
+        lines = text.splitlines()
+        return {**base, "ok": True, "detail": "\n".join(lines[:3]) if len(lines) >= 3 else text.split("\n", 1)[0]}
+    if ok:
+        return {**base, "ok": True, "detail": "multiplex session active", "error": None}
+    return {**base, "ok": False, "detail": None}
+
+
+def collect_auth_and_device_metrics(
+    cfg: dict[str, Any], host: str | None, *, tick_session: bool = True
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    target = preferred_ssh_target(cfg, host)
+    timeout = max(4.0, float(cfg.get("connectTimeoutSec") or 2.0) + 2.0)
+    conn_timeout = float(cfg.get("connectTimeoutSec") or 2.0)
+    master = ssh_master_alive(cfg, target, conn_timeout)
+    if tick_session:
+        note_tick_session(reused=master)
+    remote = metrics_remote_command(include_auth_header=not master)
     result = ssh_run(cfg, target, remote, timeout)
     if not result.get("ok"):
-        return {"ok": False, "error": result.get("error"), "target": target}
+        auth = auth_from_metrics_stdout(
+            cfg,
+            target,
+            result.get("stdout") or "",
+            result.get("latencyMs"),
+            ok=False,
+            error=result.get("error"),
+        )
+        return auth, {"ok": False, "error": result.get("error"), "target": target}
 
     stdout = result.get("stdout") or ""
+    auth = auth_from_metrics_stdout(
+        cfg, target, stdout, result.get("latencyMs"), ok=True, error=None
+    )
     base: dict[str, Any] = {"ok": True, "target": target, "gpus": []}
     for line in stdout.splitlines():
         if line.startswith("METRICS_JSON:"):
@@ -890,7 +1215,10 @@ def collect_device_metrics(cfg: dict[str, Any], host: str | None) -> dict[str, A
     if base.get("memTotalKb"):
         base["memUsedGb"] = round(float(base["memUsedKb"]) / (1024 * 1024), 1)
         base["memTotalGb"] = round(float(base["memTotalKb"]) / (1024 * 1024), 1)
-    return base
+    if not auth.get("ok"):
+        base["ok"] = False
+        base["error"] = auth.get("error") or "SSH auth failed"
+    return auth, base
 
 
 def live_tok_per_sec(host: str, port: int, timeout: float, dwell: float = 0.8) -> float | None:
@@ -917,14 +1245,16 @@ def live_tok_per_sec(host: str, port: int, timeout: float, dwell: float = 0.8) -
 def build_status(cfg: dict[str, Any], with_rates: bool = True, with_live_tok: bool = True) -> dict[str, Any]:
     conn = connect(cfg)
     host = conn.get("host")
-    auth = ssh_auth_status(cfg, str(host) if host else None)
-    services = discover_services(cfg, conn) if conn.get("ok") else []
-    rates = sample_iface_rates(str(cfg.get("iface") or "")) if with_rates else None
-
+    auth: dict[str, Any] = {
+        "ok": False,
+        "target": preferred_ssh_target(cfg, str(host) if host else None),
+        "keyPath": str(cfg.get("sshKeyPath") or ""),
+        "error": "not connected",
+    }
     device = None
     history = load_history(int(cfg.get("historyPoints") or 30))
-    if auth.get("ok"):
-        device = collect_device_metrics(cfg, str(host) if host else None)
+    if conn.get("ok"):
+        auth, device = collect_auth_and_device_metrics(cfg, str(host) if host else None)
         if device and device.get("ok"):
             history = push_history(
                 history,
@@ -935,6 +1265,9 @@ def build_status(cfg: dict[str, Any], with_rates: bool = True, with_live_tok: bo
                 },
                 int(cfg.get("historyPoints") or 30),
             )
+
+    services = discover_services(cfg, conn, ssh_auth=auth if conn.get("ok") else None) if conn.get("ok") else []
+    rates = sample_iface_rates(str(cfg.get("iface") or "")) if with_rates else None
 
     llm = next((s for s in services if s.get("id") == "tensorfold" and s.get("health")), None)
     if with_live_tok and llm and host:
@@ -989,11 +1322,15 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    reset_tick_debug()
+    mark_status_tick()
     cfg = load_config()
     if args.transport:
         cfg["transport"] = args.transport
     payload = build_status(cfg, with_rates=not args.no_rates, with_live_tok=not args.fast)
-    return emit(payload, args.json)
+    code = emit(payload, args.json)
+    flush_tick_debug_log()
+    return code
 
 
 def cmd_auth_status(args: argparse.Namespace) -> int:
@@ -1051,6 +1388,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
 def cmd_logout(_: argparse.Namespace) -> int:
     """Forget SSH target binding in config (does not delete the key file)."""
     cfg = load_config()
+    close_multiplex_sessions(cfg)
     cfg["sshTarget"] = ""
     # Keep user/key path so reconnect is easy; auth-status will fail until re-auth
     # if the remote key was revoked. Locally we only clear the remembered target.
@@ -1067,9 +1405,39 @@ def cmd_logout(_: argparse.Namespace) -> int:
     return emit(payload, True)
 
 
+def cmd_close_session(args: argparse.Namespace) -> int:
+    """Close the OpenSSH multiplex master (testing / manual session reset)."""
+    cfg = load_config()
+    host_override = (args.host or "").strip() or None
+    closed = close_multiplex_sessions(cfg, host_override=host_override)
+    targets = closed.get("targets") or []
+    target = targets[0] if targets else preferred_ssh_target(cfg, host_override)
+    sockets_closed = int(closed.get("socketsClosed") or 0)
+    if _debug_log_enabled():
+        append_debug_line(f"CLOSE_SESSION {sockets_closed} sockets")
+    payload = {
+        "ok": True,
+        "ts": time.time(),
+        "auth": {
+            "ok": False,
+            "error": "session closed",
+            "target": target,
+            "targets": targets,
+            "socketsClosed": sockets_closed,
+        },
+    }
+    return emit(payload, args.json)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="DGX Spark Status collector")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--debug-log",
+        metavar="FILE",
+        default="",
+        help="append secret-free multiplex session lines (or set DGX_SPARK_WIDGET_DEBUG=1)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init-config", help="write default config")
@@ -1105,7 +1473,13 @@ def main() -> int:
     p_logout = sub.add_parser("logout", help="clear remembered SSH target")
     p_logout.set_defaults(func=cmd_logout)
 
+    p_close = sub.add_parser("close-session", help="close SSH multiplex master (ssh -O exit)")
+    p_close.add_argument("--host", default="")
+    p_close.add_argument("--json", action="store_true")
+    p_close.set_defaults(func=cmd_close_session)
+
     args = parser.parse_args()
+    init_debug_logging(args.debug_log or None)
     if getattr(args, "json", False) is False and "--json" in sys.argv:
         args.json = True
     return int(args.func(args))
