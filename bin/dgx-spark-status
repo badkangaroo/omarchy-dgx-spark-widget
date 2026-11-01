@@ -73,10 +73,30 @@ def note_tick_session(*, reused: bool) -> None:
     _tick_debug["reused"] = reused
 
 
-def flush_tick_debug_log() -> None:
+def mark_status_tick() -> None:
+    """Only status polls should emit NEW_LOGIN/REUSED tick lines."""
+    _tick_debug["tick"] = True
+
+
+def append_debug_line(message: str) -> None:
     if not _debug_log_path:
         return
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"{ts} {message}\n"
+    try:
+        _debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with _debug_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def flush_tick_debug_log() -> None:
+    if not _debug_log_path or not _tick_debug.get("tick"):
+        return
     reused = bool(_tick_debug.get("reused"))
+    if _tick_debug.get("reauth"):
+        reused = False
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     parts = [ts]
     if _tick_debug.get("reauth"):
@@ -440,6 +460,70 @@ def remove_stale_control_socket(cfg: dict[str, Any], target: str, timeout: float
         pass
 
 
+def multiplex_close_targets(cfg: dict[str, Any], host_override: str | None = None) -> list[str]:
+    """SSH targets used for -O exit — same host resolution as status ticks."""
+    if host_override and str(host_override).strip():
+        return [preferred_ssh_target(cfg, str(host_override).strip())]
+    conn = connect(cfg)
+    if conn.get("ok") and conn.get("host"):
+        return [preferred_ssh_target(cfg, str(conn["host"]))]
+    return [preferred_ssh_target(cfg)]
+
+
+def ssh_master_exit_control_path(
+    cfg: dict[str, Any], sock_path: Path, target: str, timeout: float
+) -> bool:
+    cmd = [
+        "ssh",
+        *ssh_common_options(cfg, timeout),
+        "-S",
+        str(sock_path),
+        "-O",
+        "exit",
+        target,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def sweep_control_dir_sockets(cfg: dict[str, Any], targets: list[str], timeout: float) -> int:
+    """Safety net: exit or remove every cm-* control socket under the widget dir."""
+    closed = 0
+    ctrl = ssh_control_dir()
+    fallback = targets[0] if targets else preferred_ssh_target(cfg)
+    try_targets = targets if targets else [fallback]
+    for entry in sorted(ctrl.glob("cm-*")):
+        if not entry.exists():
+            continue
+        handled = False
+        for target in try_targets:
+            if ssh_master_exit_control_path(cfg, entry, target, timeout):
+                handled = True
+                break
+        if not handled:
+            try:
+                entry.unlink()
+                handled = True
+            except OSError:
+                pass
+        if handled:
+            closed += 1
+    return closed
+
+
+def close_multiplex_sessions(cfg: dict[str, Any], host_override: str | None = None) -> dict[str, Any]:
+    timeout = float(cfg.get("connectTimeoutSec") or 2.0)
+    targets = multiplex_close_targets(cfg, host_override)
+    for target in targets:
+        ssh_master_exit(cfg, target, timeout)
+        remove_stale_control_socket(cfg, target, timeout)
+    sockets_closed = sweep_control_dir_sockets(cfg, targets, timeout)
+    return {"targets": targets, "socketsClosed": sockets_closed}
+
+
 def is_ssh_reauth_error(result: dict[str, Any]) -> bool:
     rc = result.get("returncode")
     if rc == 255:
@@ -576,6 +660,7 @@ def ssh_run(
         return result
     reason = result.get("error") or f"exit {result.get('returncode')}"
     note_tick_reauth(str(reason))
+    note_tick_session(reused=False)
     ssh_master_exit(cfg, target, timeout)
     remove_stale_control_socket(cfg, target, timeout)
     return ssh_run(cfg, target, remote, timeout, allow_retry=False)
@@ -1238,6 +1323,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     reset_tick_debug()
+    mark_status_tick()
     cfg = load_config()
     if args.transport:
         cfg["transport"] = args.transport
@@ -1302,10 +1388,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
 def cmd_logout(_: argparse.Namespace) -> int:
     """Forget SSH target binding in config (does not delete the key file)."""
     cfg = load_config()
-    target = preferred_ssh_target(cfg)
-    timeout = float(cfg.get("connectTimeoutSec") or 2.0)
-    ssh_master_exit(cfg, target, timeout)
-    remove_stale_control_socket(cfg, target, timeout)
+    close_multiplex_sessions(cfg)
     cfg["sshTarget"] = ""
     # Keep user/key path so reconnect is easy; auth-status will fail until re-auth
     # if the remote key was revoked. Locally we only clear the remembered target.
@@ -1324,20 +1407,26 @@ def cmd_logout(_: argparse.Namespace) -> int:
 
 def cmd_close_session(args: argparse.Namespace) -> int:
     """Close the OpenSSH multiplex master (testing / manual session reset)."""
-    reset_tick_debug()
     cfg = load_config()
-    target = preferred_ssh_target(cfg, args.host or None)
-    timeout = float(cfg.get("connectTimeoutSec") or 2.0)
-    ssh_master_exit(cfg, target, timeout)
-    remove_stale_control_socket(cfg, target, timeout)
+    host_override = (args.host or "").strip() or None
+    closed = close_multiplex_sessions(cfg, host_override=host_override)
+    targets = closed.get("targets") or []
+    target = targets[0] if targets else preferred_ssh_target(cfg, host_override)
+    sockets_closed = int(closed.get("socketsClosed") or 0)
+    if _debug_log_enabled():
+        append_debug_line(f"CLOSE_SESSION {sockets_closed} sockets")
     payload = {
         "ok": True,
         "ts": time.time(),
-        "auth": {"ok": False, "error": "session closed", "target": target},
+        "auth": {
+            "ok": False,
+            "error": "session closed",
+            "target": target,
+            "targets": targets,
+            "socketsClosed": sockets_closed,
+        },
     }
-    code = emit(payload, args.json)
-    flush_tick_debug_log()
-    return code
+    return emit(payload, args.json)
 
 
 def main() -> int:

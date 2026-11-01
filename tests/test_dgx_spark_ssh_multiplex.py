@@ -133,6 +133,7 @@ class SshMultiplexTests(unittest.TestCase):
             path = Path(tmp) / "dbg.log"
             self.mod.configure_debug_log(path)
             self.mod.reset_tick_debug()
+            self.mod.mark_status_tick()
             self.mod.note_tick_reauth("exit 255")
             self.mod.note_tick_session(reused=False)
             self.mod.flush_tick_debug_log()
@@ -140,6 +141,90 @@ class SshMultiplexTests(unittest.TestCase):
         self.assertIn("NEW_LOGIN", text)
         self.assertNotIn("password", text.lower())
         self.assertNotIn("askpass", text.lower())
+
+    def test_flush_tick_debug_skipped_without_status_tick(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dbg.log"
+            self.mod.configure_debug_log(path)
+            self.mod.reset_tick_debug()
+            self.mod.flush_tick_debug_log()
+            if path.exists():
+                self.assertEqual(path.read_text(encoding="utf-8"), "")
+
+    def test_reauth_debug_line_uses_new_login_not_reused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dbg.log"
+            self.mod.configure_debug_log(path)
+            self.mod.reset_tick_debug()
+            self.mod.mark_status_tick()
+            self.mod.note_tick_session(reused=True)
+            self.mod.note_tick_reauth("Permission denied (publickey).")
+            self.mod.note_tick_session(reused=False)
+            self.mod.flush_tick_debug_log()
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("REAUTH after Permission denied (publickey).", text)
+        self.assertIn("NEW_LOGIN", text)
+        self.assertNotIn(" REUSED", text)
+
+    def test_multiplex_close_targets_uses_connect_host_not_ssh_target(self):
+        cfg = dict(self.cfg)
+        cfg["sshTarget"] = "okita@10.0.1.99"
+        cfg["sshUser"] = "okita"
+        conn = {"ok": True, "host": "100.69.65.33", "transport": "tailscale"}
+        with mock.patch.object(self.mod, "connect", return_value=conn):
+            targets = self.mod.multiplex_close_targets(cfg)
+        self.assertEqual(targets, ["okita@100.69.65.33"])
+
+    def test_multiplex_close_targets_host_override(self):
+        cfg = dict(self.cfg)
+        with mock.patch.object(self.mod, "connect") as mock_connect:
+            targets = self.mod.multiplex_close_targets(cfg, host_override="100.69.65.33")
+        mock_connect.assert_not_called()
+        self.assertEqual(targets, ["alex@100.69.65.33"])
+
+    def test_sweep_control_dir_removes_cm_sockets(self):
+        import tempfile
+
+        cfg = dict(self.cfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            ctrl = Path(tmp)
+            sock = ctrl / "cm-deadbeef"
+            sock.touch()
+            with mock.patch.object(self.mod, "ssh_control_dir", return_value=ctrl):
+                with mock.patch.object(
+                    self.mod,
+                    "ssh_master_exit_control_path",
+                    return_value=False,
+                ) as mock_exit:
+                    n = self.mod.sweep_control_dir_sockets(cfg, ["alex@spark-test"], 2.0)
+            mock_exit.assert_called()
+            self.assertEqual(n, 1)
+            self.assertFalse(sock.exists())
+
+    def test_close_session_no_status_tick_line(self):
+        import argparse
+        import tempfile
+
+        cfg = dict(self.cfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dbg.log"
+            self.mod.configure_debug_log(path)
+            args = argparse.Namespace(host="", json=False)
+            with mock.patch.object(self.mod, "load_config", return_value=cfg):
+                with mock.patch.object(
+                    self.mod,
+                    "close_multiplex_sessions",
+                    return_value={"targets": ["alex@100.69.65.33"], "socketsClosed": 2},
+                ):
+                    self.mod.cmd_close_session(args)
+            text = path.read_text(encoding="utf-8")
+        self.assertNotIn("NEW_LOGIN", text)
+        self.assertNotIn("REUSED", text)
+        self.assertIn("CLOSE_SESSION 2 sockets", text)
 
     def test_askpass_env_does_not_put_password_on_argv(self):
         env, pass_file, ask_file = self.mod.askpass_env("hunter2")
